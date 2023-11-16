@@ -28,11 +28,14 @@ func (a *InboundController) initRouter(g *gin.RouterGroup) {
 	g.POST("/add", a.addInbound)
 	g.POST("/del/:id", a.delInbound)
 	g.POST("/update/:id", a.updateInbound)
+	g.POST("/multiupdate/:id", a.multiupdateInbound)
 	g.POST("/clientIps/:email", a.getClientIps)
 	g.POST("/clearClientIps/:email", a.clearClientIps)
 	g.POST("/addClient", a.addInboundClient)
+	g.POST("/multiaddClient", a.multiaddInboundClient)
 	g.POST("/:id/delClient/:clientId", a.delInboundClient)
 	g.POST("/updateClient/:clientId", a.updateInboundClient)
+	g.POST("/multiupdateClient/:clientId", a.multiupdateInboundClient)
 	g.POST("/:id/resetClientTraffic/:email", a.resetClientTraffic)
 	g.POST("/resetAllTraffics", a.resetAllTraffics)
 	g.POST("/resetAllClientTraffics/:id", a.resetAllClientTraffics)
@@ -128,6 +131,28 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 	}
 }
 
+func (a *InboundController) multiupdateInbound(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
+		return
+	}
+	inbound := &model.Inbound{
+		Id: id,
+	}
+	err = c.ShouldBind(inbound)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
+		return
+	}
+	needRestart := true
+	inbound, needRestart, err = a.inboundService.MultiupdateInbound(inbound)
+	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.update"), inbound, err)
+	if err == nil && needRestart {
+		a.xrayService.SetToNeedRestart()
+	}
+}
+
 func (a *InboundController) getClientIps(c *gin.Context) {
 	email := c.Param("email")
 
@@ -172,6 +197,27 @@ func (a *InboundController) addInboundClient(c *gin.Context) {
 	}
 }
 
+func (a *InboundController) multiaddInboundClient(c *gin.Context) {
+	data := &model.Inbound{}
+	err := c.ShouldBind(data)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
+		return
+	}
+
+	needRestart := true
+
+	needRestart, err = a.inboundService.MultiAddInboundClient(data)
+	if err != nil {
+		jsonMsg(c, "Something went wrong!", err)
+		return
+	}
+	jsonMsg(c, "Client(s) added", nil)
+	if err == nil && needRestart {
+		a.xrayService.SetToNeedRestart()
+	}
+}
+
 func (a *InboundController) delInboundClient(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
@@ -206,6 +252,29 @@ func (a *InboundController) updateInboundClient(c *gin.Context) {
 	needRestart := true
 
 	needRestart, err = a.inboundService.UpdateInboundClient(inbound, clientId)
+	if err != nil {
+		jsonMsg(c, "Something went wrong!", err)
+		return
+	}
+	jsonMsg(c, "Client updated", nil)
+	if err == nil && needRestart {
+		a.xrayService.SetToNeedRestart()
+	}
+}
+
+func (a *InboundController) multiupdateInboundClient(c *gin.Context) {
+	clientId := c.Param("clientId")
+
+	inbound := &model.Inbound{}
+	err := c.ShouldBind(inbound)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.update"), err)
+		return
+	}
+
+	needRestart := true
+
+	needRestart, err = a.inboundService.MultiUpdateInboundClient(inbound, clientId)
 	if err != nil {
 		jsonMsg(c, "Something went wrong!", err)
 		return

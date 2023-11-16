@@ -308,6 +308,67 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 	return inbound, needRestart, db.Save(oldInbound).Error
 }
 
+func (s *InboundService) MultiupdateInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
+	exist, err := s.checkPortExist(inbound.Port, inbound.Id)
+	if err != nil {
+		return inbound, false, err
+	}
+	if exist {
+		return inbound, false, common.NewError("Port already exists:", inbound.Port)
+	}
+
+	oldInbound, err := s.GetInbound(inbound.Id)
+	if err != nil {
+		return inbound, false, err
+	}
+
+	tag := oldInbound.Tag
+
+	err = s.multiUpdateClientTraffics(oldInbound, inbound)
+	if err != nil {
+		return inbound, false, err
+	}
+
+	oldInbound.Up = inbound.Up
+	oldInbound.Down = inbound.Down
+	oldInbound.Total = inbound.Total
+	oldInbound.Remark = inbound.Remark
+	oldInbound.Enable = inbound.Enable
+	oldInbound.ExpiryTime = inbound.ExpiryTime
+	oldInbound.Listen = inbound.Listen
+	oldInbound.Port = inbound.Port
+	oldInbound.Protocol = inbound.Protocol
+	oldInbound.Settings = inbound.Settings
+	oldInbound.StreamSettings = inbound.StreamSettings
+	oldInbound.Sniffing = inbound.Sniffing
+	oldInbound.Tag = fmt.Sprintf("inbound-%v", inbound.Port)
+
+	needRestart := false
+	s.xrayApi.Init(p.GetAPIPort())
+	if s.xrayApi.DelInbound(tag) == nil {
+		logger.Debug("Old inbound deleted by api:", tag)
+	}
+	if inbound.Enable {
+		inboundJson, err2 := json.MarshalIndent(oldInbound.GenXrayInboundConfig(), "", "  ")
+		if err2 != nil {
+			logger.Debug("Unable to marshal updated inbound config:", err2)
+			needRestart = true
+		} else {
+			err2 = s.xrayApi.AddInbound(inboundJson)
+			if err2 == nil {
+				logger.Debug("Updated inbound added by api:", oldInbound.Tag)
+			} else {
+				logger.Debug("Unable to update inbound by api:", err2)
+				needRestart = true
+			}
+		}
+	}
+	s.xrayApi.Close()
+
+	db := database.GetDB()
+	return inbound, needRestart, db.Save(oldInbound).Error
+}
+
 func (s *InboundService) updateClientTraffics(oldInbound *model.Inbound, newInbound *model.Inbound) error {
 	oldClients, err := s.GetClients(oldInbound)
 	if err != nil {
@@ -361,6 +422,60 @@ func (s *InboundService) updateClientTraffics(oldInbound *model.Inbound, newInbo
 			}
 		}
 	}
+	return nil
+}
+
+func (s *InboundService) multiUpdateClientTraffics(oldInbound *model.Inbound, newInbound *model.Inbound) error {
+	newTraffics := newInbound.ClientStats
+	oldClients, err := s.GetClients(oldInbound)
+	if err != nil {
+		return err
+	}
+	newClients, err := s.GetClients(newInbound)
+	if err != nil {
+		return err
+	}
+
+	db := database.GetDB()
+	tx := db.Begin()
+
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		} else {
+			tx.Commit()
+		}
+	}()
+
+	var emailExists bool
+
+	for _, newClient := range newClients {
+		emailExists = false
+		for _, oldClient := range oldClients {
+			if newClient.Email == oldClient.Email {
+				emailExists = true
+				break
+			}
+		}
+		for _, traffic := range newTraffics {
+			if traffic.Email == newClient.Email {
+				break
+			}
+			if !emailExists {
+				err = s.MultiAddClientStat(tx, oldInbound.Id, &newClient, &traffic)
+				if err != nil {
+					return err
+				}
+			}
+			if emailExists {
+				err = s.MultiUpdateClientStat(newClient.Email, &newClient, &traffic)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -441,6 +556,99 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 				} else {
 					logger.Debug("Error in adding client by api:", err1)
 					needRestart = true
+				}
+			}
+		} else {
+			needRestart = true
+		}
+	}
+	s.xrayApi.Close()
+
+	return needRestart, tx.Save(oldInbound).Error
+}
+
+func (s *InboundService) MultiAddInboundClient(data *model.Inbound) (bool, error) {
+	clients, err := s.GetClients(data)
+	if err != nil {
+		return false, err
+	}
+	traffics := data.ClientStats
+	var settings map[string]interface{}
+	err = json.Unmarshal([]byte(data.Settings), &settings)
+	if err != nil {
+		return false, err
+	}
+
+	interfaceClients := settings["clients"].([]interface{})
+	existEmail, err := s.checkEmailsExistForClients(clients)
+	if err != nil {
+		return false, err
+	}
+	if existEmail != "" {
+		return false, common.NewError("Duplicate email:", existEmail)
+	}
+
+	oldInbound, err := s.GetInbound(data.Id)
+	if err != nil {
+		return false, err
+	}
+
+	var oldSettings map[string]interface{}
+	err = json.Unmarshal([]byte(oldInbound.Settings), &oldSettings)
+	if err != nil {
+		return false, err
+	}
+
+	oldClients := oldSettings["clients"].([]interface{})
+	oldClients = append(oldClients, interfaceClients...)
+
+	oldSettings["clients"] = oldClients
+
+	newSettings, err := json.MarshalIndent(oldSettings, "", "  ")
+	if err != nil {
+		return false, err
+	}
+
+	oldInbound.Settings = string(newSettings)
+
+	db := database.GetDB()
+	tx := db.Begin()
+
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		} else {
+			tx.Commit()
+		}
+	}()
+
+	needRestart := false
+	s.xrayApi.Init(p.GetAPIPort())
+	for _, client := range clients {
+		if len(client.Email) > 0 {
+			for _, traffic := range traffics {
+				if traffic.Email == client.Email {
+					break
+				}
+				s.MultiAddClientStat(tx, data.Id, &client, &traffic)
+				if client.Enable {
+					cipher := ""
+					if oldInbound.Protocol == "shadowsocks" {
+						cipher = oldSettings["method"].(string)
+					}
+					err1 := s.xrayApi.AddUser(string(oldInbound.Protocol), oldInbound.Tag, map[string]interface{}{
+						"email":    client.Email,
+						"id":       client.ID,
+						"flow":     client.Flow,
+						"password": client.Password,
+						"cipher":   cipher,
+					})
+					if err1 == nil {
+						logger.Debug("Client added by api:", client.Email)
+					} else {
+						logger.Debug("Error in adding client by api:", err1)
+						needRestart = true
+					}
 				}
 			}
 		} else {
@@ -604,6 +812,145 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 			err = s.UpdateClientStat(oldEmail, &clients[0])
 			if err != nil {
 				return false, err
+			}
+			err = s.UpdateClientIPs(tx, oldEmail, clients[0].Email)
+			if err != nil {
+				return false, err
+			}
+		} else {
+			s.AddClientStat(tx, data.Id, &clients[0])
+		}
+	} else {
+		err = s.DelClientStat(tx, oldEmail)
+		if err != nil {
+			return false, err
+		}
+		err = s.DelClientIPs(tx, oldEmail)
+		if err != nil {
+			return false, err
+		}
+	}
+	needRestart := false
+	if len(oldEmail) > 0 {
+		s.xrayApi.Init(p.GetAPIPort())
+		if s.xrayApi.RemoveUser(oldInbound.Tag, oldEmail) == nil {
+			logger.Debug("Old client deleted by api:", clients[0].Email)
+		}
+		if clients[0].Enable {
+			cipher := ""
+			if oldInbound.Protocol == "shadowsocks" {
+				cipher = oldSettings["method"].(string)
+			}
+			err1 := s.xrayApi.AddUser(string(oldInbound.Protocol), oldInbound.Tag, map[string]interface{}{
+				"email":    clients[0].Email,
+				"id":       clients[0].ID,
+				"flow":     clients[0].Flow,
+				"password": clients[0].Password,
+				"cipher":   cipher,
+			})
+			if err1 == nil {
+				logger.Debug("Client edited by api:", clients[0].Email)
+			} else {
+				logger.Debug("Error in adding client by api:", err1)
+				needRestart = true
+			}
+		}
+		s.xrayApi.Close()
+	} else {
+		logger.Debug("Client old email not found")
+		needRestart = true
+	}
+	return needRestart, tx.Save(oldInbound).Error
+}
+
+func (s *InboundService) MultiUpdateInboundClient(data *model.Inbound, clientId string) (bool, error) {
+	clients, err := s.GetClients(data)
+	if err != nil {
+		return false, err
+	}
+	traffics := data.ClientStats
+	var settings map[string]interface{}
+	err = json.Unmarshal([]byte(data.Settings), &settings)
+	if err != nil {
+		return false, err
+	}
+
+	inerfaceClients := settings["clients"].([]interface{})
+
+	oldInbound, err := s.GetInbound(data.Id)
+	if err != nil {
+		return false, err
+	}
+
+	oldClients, err := s.GetClients(oldInbound)
+	if err != nil {
+		return false, err
+	}
+
+	oldEmail := ""
+	clientIndex := 0
+	for index, oldClient := range oldClients {
+		oldClientId := ""
+		if oldInbound.Protocol == "trojan" {
+			oldClientId = oldClient.Password
+		} else if oldInbound.Protocol == "shadowsocks" {
+			oldClientId = oldClient.Email
+		} else {
+			oldClientId = oldClient.ID
+		}
+		if clientId == oldClientId {
+			oldEmail = oldClient.Email
+			clientIndex = index
+			break
+		}
+	}
+
+	if len(clients[0].Email) > 0 && clients[0].Email != oldEmail {
+		existEmail, err := s.checkEmailsExistForClients(clients)
+		if err != nil {
+			return false, err
+		}
+		if existEmail != "" {
+			return false, common.NewError("Duplicate email:", existEmail)
+		}
+	}
+
+	var oldSettings map[string]interface{}
+	err = json.Unmarshal([]byte(oldInbound.Settings), &oldSettings)
+	if err != nil {
+		return false, err
+	}
+	settingsClients := oldSettings["clients"].([]interface{})
+	settingsClients[clientIndex] = inerfaceClients[0]
+	oldSettings["clients"] = settingsClients
+
+	newSettings, err := json.MarshalIndent(oldSettings, "", "  ")
+	if err != nil {
+		return false, err
+	}
+
+	oldInbound.Settings = string(newSettings)
+	db := database.GetDB()
+	tx := db.Begin()
+
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		} else {
+			tx.Commit()
+		}
+	}()
+
+	if len(clients[0].Email) > 0 {
+		if len(oldEmail) > 0 {
+			if traffics[0].Email == oldEmail {
+				err = s.MultiUpdateClientStat(oldEmail, &clients[0], &traffics[0])
+				if err != nil {
+					return false, err
+				}
+			}
+			if traffics[0].Email != oldEmail {
+				return false, common.NewError("Trafiic email Wrong")
 			}
 			err = s.UpdateClientIPs(tx, oldEmail, clients[0].Email)
 			if err != nil {
@@ -920,6 +1267,42 @@ func (s *InboundService) UpdateClientStat(email string, client *model.Client) er
 			"email":       client.Email,
 			"total":       client.TotalGB,
 			"expiry_time": client.ExpiryTime})
+	err := result.Error
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *InboundService) MultiAddClientStat(tx *gorm.DB, inboundId int, client *model.Client, traffic *xray.ClientTraffic) error {
+	clientTraffic := xray.ClientTraffic{}
+	clientTraffic.InboundId = inboundId
+	clientTraffic.Email = client.Email
+	clientTraffic.Total = client.TotalGB
+	clientTraffic.ExpiryTime = client.ExpiryTime
+	clientTraffic.Enable = true
+	clientTraffic.Up = traffic.Up
+	clientTraffic.Down = traffic.Down
+	result := tx.Create(&clientTraffic)
+	err := result.Error
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *InboundService) MultiUpdateClientStat(email string, client *model.Client, traffic *xray.ClientTraffic) error {
+	db := database.GetDB()
+
+	result := db.Model(xray.ClientTraffic{}).
+		Where("email = ?", email).
+		Updates(map[string]interface{}{
+			"enable":      true,
+			"email":       client.Email,
+			"total":       client.TotalGB,
+			"expiry_time": client.ExpiryTime,
+			"Up":          traffic.Up,
+			"Down":        traffic.Down})
 	err := result.Error
 	if err != nil {
 		return err
